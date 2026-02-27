@@ -155,6 +155,11 @@ export default {
         return await updateStock(env.DB, id, await request.json());
       }
 
+      // ========== 庫存異動記錄 API ==========
+      if (path === '/api/inventory-logs' && method === 'GET') {
+        return await getInventoryLogs(env.DB, url.searchParams);
+      }
+
       // ========== 分類 API ==========
       if (path === '/api/categories' && method === 'GET') {
         return await getCategories(env.DB);
@@ -1069,6 +1074,49 @@ async function updateStock(db, productId, data) {
     after: newStock,
     change: changeQty
   }, '庫存更新成功');
+}
+
+// 查詢庫存異動記錄
+async function getInventoryLogs(db, params) {
+  const productId = params.get('product_id');
+  const changeType = params.get('change_type');
+  const startDate = params.get('start_date');
+  const endDate = params.get('end_date');
+  const limit = parseInt(params.get('limit')) || 100;
+  const offset = parseInt(params.get('offset')) || 0;
+
+  let sql = `
+    SELECT l.*, p.name as product_name, p.category_id
+    FROM inventory_logs l
+    LEFT JOIN products p ON l.product_id = p.product_id
+    WHERE 1=1
+  `;
+  const bindings = [];
+
+  if (productId) {
+    sql += ' AND l.product_id = ?';
+    bindings.push(productId);
+  }
+  if (changeType) {
+    sql += ' AND l.change_type = ?';
+    bindings.push(changeType);
+  }
+  if (startDate) {
+    sql += ' AND l.created_at >= ?';
+    bindings.push(startDate);
+  }
+  if (endDate) {
+    sql += ' AND l.created_at <= ?';
+    bindings.push(endDate + ' 23:59:59');
+  }
+
+  sql += ' ORDER BY l.created_at DESC LIMIT ? OFFSET ?';
+  bindings.push(limit, offset);
+
+  const stmt = db.prepare(sql);
+  const result = await stmt.bind(...bindings).all();
+
+  return successResponse(result.results);
 }
 
 // ==========================================
