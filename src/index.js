@@ -712,7 +712,8 @@ async function updateProduct(db, productId, data) {
 
   const allowedFields = [
     'category_id', 'name', 'original_model', 'list_price', 'cost_price',
-    'stock_qty', 'low_stock_threshold', 'unit', 'image_path', 'description', 'specs', 'status'
+    'stock_qty', 'low_stock_threshold', 'unit', 'image_path', 'description', 'specs', 'status',
+    'model', 'sub_category'
   ];
 
   for (const field of allowedFields) {
