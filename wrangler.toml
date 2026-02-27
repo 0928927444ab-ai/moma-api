@@ -1,0 +1,14 @@
+# 摩瑪建材 API - Cloudflare Workers 設定
+name = "moma-api"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+
+# D1 資料庫綁定
+[[d1_databases]]
+binding = "DB"
+database_name = "moma-dealer-system"
+database_id = "f4a3e9f5-3e07-4e72-bb1a-c282ba5cc1df"
+
+# CORS 設定 (允許前端存取)
+[vars]
+ALLOWED_ORIGINS = "*"
