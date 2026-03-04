@@ -1,0 +1,20 @@
+CREATE TABLE IF NOT EXISTS commission_records (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  record_id TEXT UNIQUE NOT NULL,
+  settlement_month TEXT NOT NULL,
+  recipient_id TEXT NOT NULL,
+  recipient_name TEXT NOT NULL,
+  source_customer_id TEXT NOT NULL,
+  source_customer_name TEXT NOT NULL,
+  order_id TEXT,
+  list_price REAL DEFAULT 0,
+  from_discount INTEGER DEFAULT 100,
+  to_discount INTEGER DEFAULT 100,
+  commission_before_tax REAL DEFAULT 0,
+  commission_after_tax REAL DEFAULT 0,
+  status TEXT DEFAULT 'pending',
+  paid_date TEXT,
+  notes TEXT,
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now'))
+);

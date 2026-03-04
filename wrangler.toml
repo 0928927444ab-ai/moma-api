@@ -12,3 +12,7 @@ database_id = "f4a3e9f5-3e07-4e72-bb1a-c282ba5cc1df"
 # CORS 設定 (允許前端存取)
 [vars]
 ALLOWED_ORIGINS = "*"
+
+# Workers AI 綁定 (用於名片辨識)
+[ai]
+binding = "AI"

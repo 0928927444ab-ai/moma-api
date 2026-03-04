@@ -366,8 +366,8 @@ async function createCustomer(db, data) {
     .prepare(
       `INSERT INTO customers (customer_id, name, short_name, type, discount_rate, parent_id, tax_id,
        contact_name, contact_phone, password, email, fax, payment_method, shipping_method,
-       invoice_address, mailing_address, shipping_address, role, status, notes, contacts, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       invoice_address, mailing_address, shipping_address, role, status, notes, contacts, created_at, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       customerId,
@@ -391,7 +391,8 @@ async function createCustomer(db, data) {
       data.status || '啟用',
       data.notes || null,
       data.contacts || null,  // 多聯絡人 JSON
-      createdAt  // 建立時間
+      createdAt,  // 建立時間
+      data.created_by || data.operator || null  // 建立者
     )
     .run();
 
