@@ -60,6 +60,11 @@ export default {
         return await deleteCustomer(env.DB, id);
       }
 
+      // ========== 客戶變更記錄 API ==========
+      if (path === '/api/customer-logs' && method === 'GET') {
+        return await getCustomerLogs(env.DB, url.searchParams);
+      }
+
       // ========== 統一帳號 API (accounts) ==========
       if (path === '/api/accounts' && method === 'GET') {
         return await getAccounts(env.DB, url.searchParams);
@@ -81,6 +86,12 @@ export default {
       }
       if (path === '/api/accounts/login' && method === 'POST') {
         return await loginAccount(env.DB, await request.json());
+      }
+
+      // ========== 查詢客戶關聯會員（從 members 表）==========
+      if (path.match(/^\/api\/customer-members\/[\w-]+$/) && method === 'GET') {
+        const customerId = path.split('/').pop();
+        return await getCustomerMembers(env.DB, customerId);
       }
 
       // ========== 會員 API (舊版，向後相容) ==========
@@ -141,6 +152,17 @@ export default {
         const id = path.split('/').pop();
         return await updateOrder(env.DB, id, await request.json());
       }
+      // 取消訂單（回補庫存）
+      if (path.match(/^\/api\/orders\/[\w-]+\/cancel$/) && method === 'POST') {
+        const parts = path.split('/');
+        const orderId = parts[parts.length - 2];
+        return await cancelOrder(env.DB, orderId, await request.json());
+      }
+      // 刪除訂單（不回補庫存，用於清除測試資料）
+      if (path.match(/^\/api\/orders\/[\w-]+$/) && method === 'DELETE') {
+        const id = path.split('/').pop();
+        return await deleteOrder(env.DB, id);
+      }
 
       // ========== 庫存 API ==========
       if (path === '/api/inventory' && method === 'GET') {
@@ -158,6 +180,25 @@ export default {
       // ========== 庫存異動記錄 API ==========
       if (path === '/api/inventory-logs' && method === 'GET') {
         return await getInventoryLogs(env.DB, url.searchParams);
+      }
+
+      // ========== 退佣記錄 API ==========
+      if (path === '/api/commissions' && method === 'GET') {
+        return await getCommissions(env.DB, url.searchParams);
+      }
+      if (path === '/api/commissions' && method === 'POST') {
+        return await createCommission(env.DB, await request.json());
+      }
+      if (path === '/api/commissions/batch' && method === 'POST') {
+        return await createCommissionBatch(env.DB, await request.json());
+      }
+      if (path.match(/^\/api\/commissions\/[\w-]+$/) && method === 'PUT') {
+        const id = path.split('/').pop();
+        return await updateCommission(env.DB, id, await request.json());
+      }
+      if (path.match(/^\/api\/commissions\/[\w-]+$/) && method === 'DELETE') {
+        const id = path.split('/').pop();
+        return await deleteCommission(env.DB, id);
       }
 
       // ========== 分類 API ==========
@@ -179,6 +220,7 @@ export default {
           endpoints: [
             'GET/POST /api/customers',
             'GET/PUT/DELETE /api/customers/:id',
+            'GET /api/customer-logs',
             'GET/POST /api/members',
             'GET/PUT/DELETE /api/members/:id',
             'POST /api/members/login',
@@ -186,6 +228,10 @@ export default {
             'GET/PUT /api/products/:id',
             'GET/POST /api/orders',
             'GET/PUT /api/orders/:id',
+            'GET /api/inventory-logs',
+            'GET/POST /api/commissions',
+            'POST /api/commissions/batch',
+            'PUT/DELETE /api/commissions/:id',
             'GET /api/categories',
             'GET /api/pricing-rules',
           ],
@@ -195,6 +241,14 @@ export default {
       // ========== 手動備份 API ==========
       if (path === '/api/backup' && method === 'POST') {
         return await backupToGoogleSheets(env.DB, env.GOOGLE_SCRIPT_URL);
+      }
+
+      // ========== 匯出 API (GitHub 備份用) ==========
+      if (path === '/api/export/customers' && method === 'GET') {
+        return await exportCustomers(env.DB);
+      }
+      if (path === '/api/export/all' && method === 'GET') {
+        return await exportAllData(env.DB);
       }
 
       return errorResponse('找不到此 API 路徑', 404);
@@ -259,26 +313,62 @@ async function getCustomer(db, customerId) {
 }
 
 async function createCustomer(db, data) {
-  // 產生客戶 ID
-  const countResult = await db.prepare('SELECT COUNT(*) as count FROM customers').first();
-  const customerId = `C${String(countResult.count + 1).padStart(3, '0')}`;
+  // 客戶分類對應表：編號開頭 + 預設折數
+  const typeConfig = {
+    'M-子公司':          { prefix: 'M', discount: null },   // 折數另外設定
+    'M-注資經銷商':      { prefix: 'O', discount: 35 },
+    'M-無底薪業務':      { prefix: 'R', discount: 55 },
+    '全品項經銷商':      { prefix: 'A', discount: 35 },
+    '單品項經銷商':      { prefix: 'S', discount: 35 },
+    '建築師/營造廠':     { prefix: 'E', discount: 75 },
+    '設計師/工程行':     { prefix: 'E', discount: 75 },
+    'BNI綠燈會員':       { prefix: 'N', discount: 75 },
+    '大台中南區綠燈會員': { prefix: 'T', discount: 60 },
+    '建材行':            { prefix: 'B', discount: 50 },
+    '專案':              { prefix: 'P', discount: 50 },
+    '一般':              { prefix: 'G', discount: 100 }     // 牌價 = 100 (10折)
+  };
+
+  const config = typeConfig[data.type] || { prefix: 'C', discount: 100 };
+  const prefix = config.prefix;
+
+  // 如果沒有指定折數，使用分類預設折數
+  if (!data.discount_rate && config.discount) {
+    data.discount_rate = config.discount;
+  }
+
+  // 產生客戶 ID - 找到該開頭最大的編號 +1
+  const maxIdResult = await db.prepare(
+    `SELECT customer_id FROM customers WHERE customer_id LIKE '${prefix}%' ORDER BY customer_id DESC LIMIT 1`
+  ).first();
+
+  let nextNum = 1;
+  if (maxIdResult && maxIdResult.customer_id) {
+    const currentNum = parseInt(maxIdResult.customer_id.substring(1), 10);
+    if (!isNaN(currentNum)) {
+      nextNum = currentNum + 1;
+    }
+  }
+  const customerId = `${prefix}${String(nextNum).padStart(3, '0')}`;
 
   const result = await db
     .prepare(
-      `INSERT INTO customers (customer_id, name, type, discount_rate, parent_id, tax_id,
-       contact_name, contact_phone, email, fax, payment_method, shipping_method,
-       invoice_address, mailing_address, shipping_address, role, status, notes)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO customers (customer_id, name, short_name, type, discount_rate, parent_id, tax_id,
+       contact_name, contact_phone, password, email, fax, payment_method, shipping_method,
+       invoice_address, mailing_address, shipping_address, role, status, notes, contacts)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       customerId,
       data.name,
+      data.short_name || null,
       data.type || null,
       data.discount_rate || 100,
       data.parent_id || null,
       data.tax_id || null,
       data.contact_name || null,
       data.contact_phone || null,
+      data.password || null,
       data.email || null,
       data.fax || null,
       data.payment_method || null,
@@ -288,28 +378,69 @@ async function createCustomer(db, data) {
       data.shipping_address || null,
       data.role || '會員',
       data.status || '啟用',
-      data.notes || null
+      data.notes || null,
+      data.contacts || null  // 多聯絡人 JSON
     )
     .run();
+
+  // 記錄變更日誌
+  await logCustomerChange(db, customerId, 'CREATE', null, data, data.operator || '系統');
 
   return successResponse({ customer_id: customerId }, '客戶建立成功');
 }
 
 async function updateCustomer(db, customerId, data) {
+  // 取得更新前的資料
+  const oldData = await db
+    .prepare('SELECT * FROM customers WHERE customer_id = ?')
+    .bind(customerId)
+    .first();
+
+  if (!oldData) {
+    return errorResponse('找不到此客戶', 404);
+  }
+
+  // 折數固定的分類（6折及以下不可修改）
+  const fixedDiscountTypes = {
+    'M-注資經銷商': 35,
+    'M-無底薪業務': 55,
+    '全品項經銷商': 35,
+    '單品項經銷商': 35,
+    '大台中南區綠燈會員': 60,  // 6折固定
+    '建材行': 50,
+    '專案': 50
+  };
+
+  // 如果是固定折數分類，不允許修改折數
+  const customerType = data.type || oldData.type;
+  if (fixedDiscountTypes[customerType] && data.discount_rate !== undefined) {
+    const fixedDiscount = fixedDiscountTypes[customerType];
+    if (data.discount_rate !== fixedDiscount) {
+      // 強制使用固定折數
+      data.discount_rate = fixedDiscount;
+    }
+  }
+
   const fields = [];
   const values = [];
+  const changedFields = [];
 
   const allowedFields = [
-    'name', 'type', 'discount_rate', 'parent_id', 'tax_id',
-    'contact_name', 'contact_phone', 'email', 'fax',
+    'name', 'short_name', 'type', 'discount_rate', 'parent_id', 'tax_id',
+    'contact_name', 'contact_phone', 'password', 'email', 'fax',
     'payment_method', 'shipping_method', 'invoice_address',
-    'mailing_address', 'shipping_address', 'role', 'status', 'notes'
+    'mailing_address', 'shipping_address', 'role', 'status', 'notes',
+    'contacts'  // 多聯絡人 JSON
   ];
 
   for (const field of allowedFields) {
     if (data[field] !== undefined) {
       fields.push(`${field} = ?`);
       values.push(data[field]);
+      // 記錄實際變更的欄位
+      if (oldData[field] !== data[field]) {
+        changedFields.push(field);
+      }
     }
   }
 
@@ -325,10 +456,25 @@ async function updateCustomer(db, customerId, data) {
     .bind(...values)
     .run();
 
+  // 記錄變更日誌（只有實際變更才記錄）
+  if (changedFields.length > 0) {
+    await logCustomerChange(db, customerId, 'UPDATE', oldData, data, data.operator || '系統', changedFields);
+  }
+
   return successResponse({ customer_id: customerId }, '客戶更新成功');
 }
 
 async function deleteCustomer(db, customerId) {
+  // 取得刪除前的資料
+  const oldData = await db
+    .prepare('SELECT * FROM customers WHERE customer_id = ?')
+    .bind(customerId)
+    .first();
+
+  if (!oldData) {
+    return errorResponse('找不到此客戶', 404);
+  }
+
   // 檢查是否有關聯會員
   const members = await db
     .prepare('SELECT COUNT(*) as count FROM members WHERE customer_id = ?')
@@ -341,7 +487,72 @@ async function deleteCustomer(db, customerId) {
 
   await db.prepare('DELETE FROM customers WHERE customer_id = ?').bind(customerId).run();
 
+  // 記錄變更日誌
+  await logCustomerChange(db, customerId, 'DELETE', oldData, null, '系統');
+
   return successResponse({ customer_id: customerId }, '客戶刪除成功');
+}
+
+// 記錄客戶變更
+async function logCustomerChange(db, customerId, action, oldData, newData, operator, changedFields = []) {
+  await db
+    .prepare(
+      `INSERT INTO customer_logs (customer_id, action, old_data, new_data, changed_fields, operator)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      customerId,
+      action,
+      oldData ? JSON.stringify(oldData) : null,
+      newData ? JSON.stringify(newData) : null,
+      changedFields.length > 0 ? changedFields.join(',') : null,
+      operator
+    )
+    .run();
+}
+
+// 查詢客戶變更記錄
+async function getCustomerLogs(db, params) {
+  let query = 'SELECT * FROM customer_logs WHERE 1=1';
+  const bindings = [];
+
+  if (params.get('customer_id')) {
+    query += ' AND customer_id = ?';
+    bindings.push(params.get('customer_id'));
+  }
+  if (params.get('action')) {
+    query += ' AND action = ?';
+    bindings.push(params.get('action'));
+  }
+  if (params.get('start_date')) {
+    query += ' AND created_at >= ?';
+    bindings.push(params.get('start_date'));
+  }
+  if (params.get('end_date')) {
+    query += ' AND created_at <= ?';
+    bindings.push(params.get('end_date') + ' 23:59:59');
+  }
+
+  const limit = parseInt(params.get('limit')) || 100;
+  const offset = parseInt(params.get('offset')) || 0;
+
+  query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
+  bindings.push(limit, offset);
+
+  const result = await db.prepare(query).bind(...bindings).all();
+  return successResponse(result.results);
+}
+
+// ==========================================
+// 查詢客戶關聯會員（從 members 表）
+// ==========================================
+
+async function getCustomerMembers(db, customerId) {
+  const result = await db
+    .prepare('SELECT * FROM members WHERE customer_id = ?')
+    .bind(customerId)
+    .all();
+  return successResponse(result.results);
 }
 
 // ==========================================
@@ -826,6 +1037,26 @@ async function createOrder(db, data) {
     .first();
   const orderId = `O${today}${String(countResult.count + 1).padStart(3, '0')}`;
 
+  // 檢查外鍵是否存在（避免 FOREIGN KEY constraint failed）
+  let validMemberId = null;
+  let validCustomerId = null;
+
+  if (data.member_id) {
+    const memberExists = await db
+      .prepare('SELECT member_id FROM members WHERE member_id = ?')
+      .bind(data.member_id)
+      .first();
+    validMemberId = memberExists ? data.member_id : null;
+  }
+
+  if (data.customer_id) {
+    const customerExists = await db
+      .prepare('SELECT customer_id FROM customers WHERE customer_id = ?')
+      .bind(data.customer_id)
+      .first();
+    validCustomerId = customerExists ? data.customer_id : null;
+  }
+
   // 建立訂單
   await db
     .prepare(
@@ -836,8 +1067,8 @@ async function createOrder(db, data) {
     )
     .bind(
       orderId,
-      data.member_id || null,
-      data.customer_id || null,
+      validMemberId,
+      validCustomerId,
       data.status || '待確認',
       data.subtotal || 0,
       data.identity_discount || 0,
@@ -935,7 +1166,8 @@ async function updateOrder(db, orderId, data) {
 
   const allowedFields = [
     'status', 'payment_method', 'shipping_method',
-    'shipping_address', 'contact_name', 'contact_phone', 'notes'
+    'shipping_address', 'contact_name', 'contact_phone', 'notes',
+    'customer_id', 'customer_name'
   ];
 
   for (const field of allowedFields) {
@@ -958,6 +1190,111 @@ async function updateOrder(db, orderId, data) {
     .run();
 
   return successResponse({ order_id: orderId }, '訂單更新成功');
+}
+
+// 取消訂單並回補庫存
+async function cancelOrder(db, orderId, data) {
+  // 1. 檢查訂單是否存在
+  const order = await db
+    .prepare('SELECT * FROM orders WHERE order_id = ?')
+    .bind(orderId)
+    .first();
+
+  if (!order) {
+    return errorResponse('找不到此訂單', 404);
+  }
+
+  // 2. 檢查訂單狀態（已取消的訂單不能再次取消）
+  if (order.status === '已取消') {
+    return errorResponse('此訂單已經取消');
+  }
+
+  // 3. 取得訂單明細
+  const items = await db
+    .prepare('SELECT * FROM order_items WHERE order_id = ?')
+    .bind(orderId)
+    .all();
+
+  const operator = data.operator || '系統';
+
+  // 4. 回補每個商品的庫存
+  for (const item of items.results) {
+    if (!item.product_id) continue;
+
+    // 查詢產品（用 product_id 字串）
+    const product = await db
+      .prepare('SELECT id, product_id, stock_qty FROM products WHERE product_id = ?')
+      .bind(item.product_id)
+      .first();
+
+    if (product) {
+      const beforeQty = product.stock_qty || 0;
+      const restoreQty = item.quantity || 1;
+      const newStock = beforeQty + restoreQty;
+
+      // 更新庫存
+      await db
+        .prepare('UPDATE products SET stock_qty = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+        .bind(newStock, product.id)
+        .run();
+
+      // 記錄庫存異動（訂單取消回補）
+      await db
+        .prepare(
+          `INSERT INTO inventory_logs (product_id, change_type, change_qty, before_qty, after_qty, reference_id, operator, notes)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .bind(
+          product.product_id,
+          '訂單取消',
+          restoreQty,
+          beforeQty,
+          newStock,
+          orderId,
+          operator,
+          `訂單 ${orderId} 取消，回補庫存`
+        )
+        .run();
+    }
+  }
+
+  // 5. 更新訂單狀態為「已取消」
+  await db
+    .prepare("UPDATE orders SET status = '已取消', updated_at = CURRENT_TIMESTAMP WHERE order_id = ?")
+    .bind(orderId)
+    .run();
+
+  return successResponse({
+    order_id: orderId,
+    restored_items: items.results.length
+  }, '訂單已取消，庫存已回補');
+}
+
+// 刪除訂單（不回補庫存）
+async function deleteOrder(db, orderId) {
+  // 檢查訂單是否存在
+  const order = await db
+    .prepare('SELECT * FROM orders WHERE order_id = ?')
+    .bind(orderId)
+    .first();
+
+  if (!order) {
+    return errorResponse('找不到此訂單', 404);
+  }
+
+  // 刪除訂單明細
+  await db
+    .prepare('DELETE FROM order_items WHERE order_id = ?')
+    .bind(orderId)
+    .run();
+
+  // 刪除訂單
+  await db
+    .prepare('DELETE FROM orders WHERE order_id = ?')
+    .bind(orderId)
+    .run();
+
+  return successResponse({ order_id: orderId }, '訂單已刪除（未調整庫存）');
 }
 
 // ==========================================
@@ -1352,6 +1689,59 @@ async function loginAccount(db, data) {
 }
 
 // ==========================================
+// 匯出 API (GitHub 備份用)
+// ==========================================
+
+async function exportCustomers(db) {
+  const customers = await db.prepare('SELECT * FROM customers ORDER BY customer_id').all();
+  const logs = await db.prepare('SELECT * FROM customer_logs ORDER BY created_at DESC LIMIT 1000').all();
+
+  const exportData = {
+    exportTime: new Date().toISOString(),
+    version: '1.0',
+    customers: customers.results,
+    customerLogs: logs.results,
+    counts: {
+      customers: customers.results.length,
+      logs: logs.results.length
+    }
+  };
+
+  return jsonResponse(exportData);
+}
+
+async function exportAllData(db) {
+  const [customers, customerLogs, products, orders, inventoryLogs] = await Promise.all([
+    db.prepare('SELECT * FROM customers ORDER BY customer_id').all(),
+    db.prepare('SELECT * FROM customer_logs ORDER BY created_at DESC').all(),
+    db.prepare('SELECT * FROM products ORDER BY product_id').all(),
+    db.prepare('SELECT * FROM orders ORDER BY created_at DESC LIMIT 1000').all(),
+    db.prepare('SELECT * FROM inventory_logs ORDER BY created_at DESC LIMIT 1000').all()
+  ]);
+
+  const exportData = {
+    exportTime: new Date().toISOString(),
+    version: '1.0',
+    data: {
+      customers: customers.results,
+      customerLogs: customerLogs.results,
+      products: products.results,
+      orders: orders.results,
+      inventoryLogs: inventoryLogs.results
+    },
+    counts: {
+      customers: customers.results.length,
+      customerLogs: customerLogs.results.length,
+      products: products.results.length,
+      orders: orders.results.length,
+      inventoryLogs: inventoryLogs.results.length
+    }
+  };
+
+  return jsonResponse(exportData);
+}
+
+// ==========================================
 // 備份到 Google Sheets
 // ==========================================
 
@@ -1411,4 +1801,169 @@ async function backupToGoogleSheets(db, googleScriptUrl) {
       timestamp: new Date().toISOString(),
     }, 500);
   }
+}
+
+// ==========================================
+// 退佣記錄 CRUD
+// ==========================================
+
+async function getCommissions(db, params) {
+  let query = 'SELECT * FROM commission_records WHERE 1=1';
+  const bindings = [];
+
+  // 篩選月份
+  if (params.get('month')) {
+    query += ' AND settlement_month = ?';
+    bindings.push(params.get('month'));
+  }
+
+  // 篩選收佣人
+  if (params.get('recipient_id')) {
+    query += ' AND recipient_id = ?';
+    bindings.push(params.get('recipient_id'));
+  }
+
+  // 篩選狀態
+  if (params.get('status')) {
+    query += ' AND status = ?';
+    bindings.push(params.get('status'));
+  }
+
+  query += ' ORDER BY created_at DESC';
+
+  const result = await db.prepare(query).bind(...bindings).all();
+  return successResponse(result.results);
+}
+
+async function createCommission(db, data) {
+  // 產生記錄 ID
+  const today = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+  const countResult = await db
+    .prepare("SELECT COUNT(*) as count FROM commission_records WHERE record_id LIKE ?")
+    .bind(`CR${today}%`)
+    .first();
+  const recordId = `CR${today}${String(countResult.count + 1).padStart(3, '0')}`;
+
+  const result = await db
+    .prepare(
+      `INSERT INTO commission_records (
+        record_id, settlement_month, recipient_id, recipient_name,
+        source_customer_id, source_customer_name, order_id,
+        list_price, from_discount, to_discount,
+        commission_before_tax, commission_after_tax, status, notes
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      recordId,
+      data.settlement_month,
+      data.recipient_id,
+      data.recipient_name,
+      data.source_customer_id,
+      data.source_customer_name,
+      data.order_id || null,
+      data.list_price || 0,
+      data.from_discount || 100,
+      data.to_discount || 100,
+      data.commission_before_tax || 0,
+      data.commission_after_tax || 0,
+      data.status || 'pending',
+      data.notes || null
+    )
+    .run();
+
+  return successResponse({ record_id: recordId }, '退佣記錄已建立');
+}
+
+async function createCommissionBatch(db, data) {
+  // 批次建立退佣記錄
+  if (!data.records || !Array.isArray(data.records)) {
+    return errorResponse('請提供 records 陣列');
+  }
+
+  const today = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+  const countResult = await db
+    .prepare("SELECT COUNT(*) as count FROM commission_records WHERE record_id LIKE ?")
+    .bind(`CR${today}%`)
+    .first();
+  let nextNum = countResult.count + 1;
+
+  const createdIds = [];
+
+  for (const record of data.records) {
+    const recordId = `CR${today}${String(nextNum++).padStart(3, '0')}`;
+
+    await db
+      .prepare(
+        `INSERT INTO commission_records (
+          record_id, settlement_month, recipient_id, recipient_name,
+          source_customer_id, source_customer_name, order_id,
+          list_price, from_discount, to_discount,
+          commission_before_tax, commission_after_tax, status, notes
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .bind(
+        recordId,
+        record.settlement_month,
+        record.recipient_id,
+        record.recipient_name,
+        record.source_customer_id,
+        record.source_customer_name,
+        record.order_id || null,
+        record.list_price || 0,
+        record.from_discount || 100,
+        record.to_discount || 100,
+        record.commission_before_tax || 0,
+        record.commission_after_tax || 0,
+        record.status || 'pending',
+        record.notes || null
+      )
+      .run();
+
+    createdIds.push(recordId);
+  }
+
+  return successResponse({ created_ids: createdIds, count: createdIds.length }, '批次建立完成');
+}
+
+async function updateCommission(db, recordId, data) {
+  // 允許更新的欄位
+  const allowedFields = ['status', 'paid_date', 'notes'];
+  const updates = [];
+  const bindings = [];
+
+  for (const field of allowedFields) {
+    if (data[field] !== undefined) {
+      updates.push(`${field} = ?`);
+      bindings.push(data[field]);
+    }
+  }
+
+  if (updates.length === 0) {
+    return errorResponse('沒有可更新的欄位');
+  }
+
+  updates.push("updated_at = datetime('now')");
+  bindings.push(recordId);
+
+  const query = `UPDATE commission_records SET ${updates.join(', ')} WHERE record_id = ?`;
+  const result = await db.prepare(query).bind(...bindings).run();
+
+  if (result.changes === 0) {
+    return errorResponse('找不到此記錄', 404);
+  }
+
+  return successResponse({ record_id: recordId }, '退佣記錄已更新');
+}
+
+async function deleteCommission(db, recordId) {
+  const result = await db
+    .prepare('DELETE FROM commission_records WHERE record_id = ?')
+    .bind(recordId)
+    .run();
+
+  if (result.changes === 0) {
+    return errorResponse('找不到此記錄', 404);
+  }
+
+  return successResponse({ record_id: recordId }, '退佣記錄已刪除');
 }
