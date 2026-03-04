@@ -211,6 +211,11 @@ export default {
         return await getPricingRules(env.DB);
       }
 
+      // ========== 名片辨識 API ==========
+      if (path === '/api/ocr/business-card' && method === 'POST') {
+        return await analyzeBusinessCard(env.AI, await request.json());
+      }
+
       // ========== 健康檢查 ==========
       if (path === '/api/health' || path === '/') {
         return jsonResponse({
@@ -351,12 +356,18 @@ async function createCustomer(db, data) {
   }
   const customerId = `${prefix}${String(nextNum).padStart(3, '0')}`;
 
+  // 取得當前台灣時間
+  const now = new Date();
+  const twOffset = 8 * 60; // UTC+8
+  const twTime = new Date(now.getTime() + twOffset * 60 * 1000);
+  const createdAt = twTime.toISOString().slice(0, 19).replace('T', ' ');
+
   const result = await db
     .prepare(
       `INSERT INTO customers (customer_id, name, short_name, type, discount_rate, parent_id, tax_id,
        contact_name, contact_phone, password, email, fax, payment_method, shipping_method,
-       invoice_address, mailing_address, shipping_address, role, status, notes, contacts)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       invoice_address, mailing_address, shipping_address, role, status, notes, contacts, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       customerId,
@@ -379,7 +390,8 @@ async function createCustomer(db, data) {
       data.role || '會員',
       data.status || '啟用',
       data.notes || null,
-      data.contacts || null  // 多聯絡人 JSON
+      data.contacts || null,  // 多聯絡人 JSON
+      createdAt  // 建立時間
     )
     .run();
 
@@ -1686,6 +1698,133 @@ async function loginAccount(db, data) {
   };
 
   return successResponse(response, '登入成功');
+}
+
+// ==========================================
+// 名片辨識 API (Workers AI)
+// ==========================================
+
+async function analyzeBusinessCard(ai, data) {
+  try {
+    const { image } = data;
+
+    if (!image) {
+      return errorResponse('請提供名片圖片');
+    }
+
+    // 移除 base64 前綴並轉換為 Uint8Array
+    let base64Data = image;
+    if (image.includes(',')) {
+      base64Data = image.split(',')[1];
+    }
+
+    // 將 base64 轉換為 Uint8Array (LLaVA 需要的格式)
+    const binaryString = atob(base64Data);
+    const bytes = new Uint8Array(binaryString.length);
+    for (let i = 0; i < binaryString.length; i++) {
+      bytes[i] = binaryString.charCodeAt(i);
+    }
+
+    console.log('圖片大小:', bytes.length, 'bytes');
+
+    // 使用 Workers AI 的 LLaVA 視覺模型分析名片
+    let response;
+    try {
+      response = await ai.run('@cf/llava-hf/llava-1.5-7b-hf', {
+        image: [...bytes],
+        prompt: `This is a business card image. Please read all the text on this card carefully.
+
+Extract the following information and return ONLY a JSON object (no other text):
+{
+  "company": "company name",
+  "name": "person name",
+  "phone": "phone number",
+  "email": "email address",
+  "address": "address",
+  "tax_id": "tax ID number (8 digits)"
+}
+
+If a field is not found, set it to empty string "".`,
+        max_tokens: 512
+      });
+    } catch (aiError) {
+      console.error('Workers AI 錯誤:', aiError);
+      return errorResponse(`AI 模型錯誤: ${aiError.message}`, 500);
+    }
+
+    console.log('AI 原始回應:', JSON.stringify(response));
+
+    // 解析 AI 回應
+    let parsedData = {
+      company: '',
+      name: '',
+      phone: '',
+      email: '',
+      address: '',
+      tax_id: ''
+    };
+
+    // 從回應中取得文字 (支援不同回應格式)
+    let responseText = '';
+    if (response) {
+      if (typeof response === 'string') {
+        responseText = response;
+      } else if (response.description) {
+        // LLaVA 回傳格式
+        responseText = response.description;
+      } else if (response.response) {
+        responseText = response.response;
+      } else if (response.result) {
+        responseText = response.result;
+      } else if (response.choices && response.choices[0]) {
+        responseText = response.choices[0].message?.content || response.choices[0].text || '';
+      }
+    }
+
+    console.log('AI 回應:', responseText);
+
+    if (responseText) {
+      try {
+        // 嘗試從回應中提取 JSON
+        const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          const parsed = JSON.parse(jsonMatch[0]);
+          parsedData = {
+            company: parsed.company || '',
+            name: parsed.name || '',
+            phone: parsed.phone || '',
+            email: parsed.email || '',
+            address: parsed.address || '',
+            tax_id: parsed.tax_id || ''
+          };
+        }
+      } catch (parseError) {
+        console.error('解析 AI 回應失敗:', parseError);
+        // 嘗試用正則表達式提取資訊
+        const text = responseText;
+
+        // 提取手機號碼
+        const phoneMatch = text.match(/09\d{8}/);
+        if (phoneMatch) parsedData.phone = phoneMatch[0];
+
+        // 提取 email
+        const emailMatch = text.match(/[\w.-]+@[\w.-]+\.\w+/);
+        if (emailMatch) parsedData.email = emailMatch[0];
+
+        // 提取統編
+        const taxMatch = text.match(/\d{8}/);
+        if (taxMatch && taxMatch[0] !== parsedData.phone?.slice(0, 8)) {
+          parsedData.tax_id = taxMatch[0];
+        }
+      }
+    }
+
+    return successResponse(parsedData, '名片辨識完成');
+
+  } catch (error) {
+    console.error('名片辨識錯誤:', error);
+    return errorResponse('名片辨識失敗: ' + error.message, 500);
+  }
 }
 
 // ==========================================
